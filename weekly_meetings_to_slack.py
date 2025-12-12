@@ -14,8 +14,10 @@ SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 TIMEZONE = ZoneInfo("Europe/Berlin")
 
 HEADERS = {
-    "Authorization": f"Bearer {HUBSPOT_API_KEY}",
-    "Content-Type": "application/json",
+    # HINWEIS: Bei einem "SyntaxError: invalid non-printable character"
+    # müssen Sie sicherstellen, dass hier keine unsichtbaren Leerzeichen sind (z.B. U+00A0).
+    "Authorization": f"Bearer {HUBSPOT_API_KEY}",
+    "Content-Type": "application/json",
 }
 
 # ==========================================================
@@ -73,6 +75,7 @@ def fetch_meetings(week_start: datetime, week_end: datetime) -> List[Dict[str, A
     all_meetings = []
     after = None # Paginierungs-Token
 
+    # Zeitstempel in Millisekunden für die Filterung
     week_start_ms = int(week_start.timestamp() * 1000)
     week_end_ms = int(week_end.timestamp() * 1000)
 
