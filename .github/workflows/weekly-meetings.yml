@@ -16,7 +16,8 @@ jobs:
           python-version: "3.11"
       - run: pip install requests
       - name: Run script
+        run: python weekly_meetings_to_slack.py
         env:
           HUBSPOT_API_KEY: ${{ secrets.HUBSPOT_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python weekly_meetings_to_slack.py
+          DEBUG: "1"
