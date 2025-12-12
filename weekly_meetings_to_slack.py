@@ -2,7 +2,11 @@ import os
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from collections import defaultdict
 
+# ==========================================================
+# ENV
+# ==========================================================
 HUBSPOT_API_KEY = os.environ["HUBSPOT_API_KEY"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 
@@ -15,6 +19,25 @@ HEADERS = {
 
 OWNER_TO_SLACK = {
     "29202437": "<@U08N63C58BC>",
+    "76287207": "<@U085X3R20P7>",
+    "1331795909": "<@U07G8B29CN5>",
+    "303586931": "<@U07K1NXC4TF>",
+    "76160549": "<@U07M9L6U4SX>",
+    "76822495": "<@U07FY6MUDEG>",
+    "380546521": "<@U083BBL20BF>",
+    "1859268659": "<@U07J82VKM9Q>",
+    "982419171": "<@U07K4G7710B>",
+    "78899599": "<@U08KDHHJ7S6>",
+    "29454051": "<@U08TTADV078>",
+    "1844730787": "<@U07JAJBKDLL>",
+    "29545650": "<@U091QQP4W85>",
+    "29700526": "<@U095R45NW8H>",
+    "30562252": "<@U09LCQSB081>",
+    "30767909": "<@U09PKAGQUF8>",
+    "30840582": "<@U09QW1PVCCS>",
+    "30287832": "<@U07M9P6JZ5G>",
+    "31172664": "<@U0A0P2V70MC>",
+    "30740680": "<@U09LSSAB3LH>",
 }
 
 WEEKDAY_DE = {
@@ -22,6 +45,9 @@ WEEKDAY_DE = {
     3: "Donnerstag", 4: "Freitag", 5: "Samstag", 6: "Sonntag"
 }
 
+# ==========================================================
+# ZEITFENSTER: diese Woche (Mo–So)
+# ==========================================================
 def week_window(now):
     start = (now - timedelta(days=now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -29,46 +55,48 @@ def week_window(now):
     end = start + timedelta(days=7)
     return start, end
 
-def extract_start_ts(item):
-    meta = item.get("metadata", {})
-    eng = item.get("engagement", {})
+# ==========================================================
+# MEETINGS VIA SEARCH API
+# ==========================================================
+def fetch_meetings(week_start, week_end):
+    url = "https://api.hubapi.com/crm/v3/objects/meetings/search"
 
-    for key in ["startTimeMillis", "startTime"]:
-        if key in meta:
-            ts = int(meta[key])
-            if ts < 10_000_000_000:
-                ts *= 1000
-            return ts
+    body = {
+        "properties": [
+            "hs_meeting_start_time",
+            "hubspot_owner_id",
+            "hs_meeting_title"
+        ],
+        "associations": ["contacts"],
+        "filterGroups": [
+            {
+                "filters": [
+                    {
+                        "propertyName": "hs_meeting_start_time",
+                        "operator": "BETWEEN",
+                        "value": str(int(week_start.timestamp() * 1000)),
+                        "highValue": str(int(week_end.timestamp() * 1000))
+                    }
+                ]
+            }
+        ],
+        "sorts": [
+            {
+                "propertyName": "hs_meeting_start_time",
+                "direction": "ASCENDING"
+            }
+        ],
+        "limit": 100
+    }
 
-    ts = eng.get("timestamp")
-    if ts:
-        return int(ts)
+    r = requests.post(url, headers=HEADERS, json=body)
+    r.raise_for_status()
 
-    return None
+    return r.json().get("results", [])
 
-def fetch_meetings():
-    url = "https://api.hubapi.com/engagements/v1/engagements/paged"
-    results = []
-    offset = 0
-    MAX_PAGES = 50  # 🔑 bewusst hoch
-
-    for _ in range(MAX_PAGES):
-        r = requests.get(
-            url,
-            headers=HEADERS,
-            params={"limit": 100, "offset": offset}
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        results.extend(data.get("results", []))
-
-        if not data.get("hasMore"):
-            break
-        offset = data.get("offset")
-
-    return results
-
+# ==========================================================
+# CONTACTS
+# ==========================================================
 def batch_read_contacts(contact_ids):
     if not contact_ids:
         return {}
@@ -78,18 +106,21 @@ def batch_read_contacts(contact_ids):
         headers=HEADERS,
         json={
             "properties": ["firstname", "lastname", "email"],
-            "inputs": [{"id": cid} for cid in contact_ids],
+            "inputs": [{"id": cid} for cid in contact_ids]
         }
     )
     r.raise_for_status()
 
     out = {}
     for res in r.json().get("results", []):
-        p = res.get("properties", {}) or {}
+        p = res.get("properties", {})
         name = " ".join(filter(None, [p.get("firstname"), p.get("lastname")]))
         out[res["id"]] = name or p.get("email") or f"Contact {res['id']}"
     return out
 
+# ==========================================================
+# SLACK MESSAGE
+# ==========================================================
 def build_message(grouped, week_start, week_end):
     ws = week_start.strftime("%d.%m.%Y")
     we = (week_end - timedelta(seconds=1)).strftime("%d.%m.%Y")
@@ -117,53 +148,49 @@ def build_message(grouped, week_start, week_end):
             )
         lines.append("")
 
+    lines.append(
+        "Solltet ihr noch offene Themen bei einem Kunden haben, "
+        "die geklärt werden sollen, dann gebt bitte frühzeitig Bescheid."
+    )
+
     return "\n".join(lines)
 
+# ==========================================================
+# MAIN
+# ==========================================================
 def main():
     now = datetime.now(TIMEZONE)
     week_start, week_end = week_window(now)
 
-    raw = fetch_meetings()
+    meetings = fetch_meetings(week_start, week_end)
 
-    meetings = []
-    for item in raw:
-        eng = item.get("engagement", {})
-        if eng.get("type") != "MEETING":
-            continue
-
-        start_ts = extract_start_ts(item)
-        if not start_ts:
-            continue
-
-        dt = datetime.fromtimestamp(start_ts / 1000, tz=TIMEZONE)
-        if not (week_start <= dt < week_end):
-            continue
-        if dt < now:
-            continue
-
-        meetings.append((item, dt))
-
+    grouped = defaultdict(list)
     contact_ids = set()
-    for m, _ in meetings:
-        contact_ids.update(m.get("associations", {}).get("contactIds", []))
+
+    for m in meetings:
+        contact_ids.update(
+            a["id"] for a in m.get("associations", {}).get("contacts", {}).get("results", [])
+        )
 
     contacts = batch_read_contacts(list(contact_ids))
 
-    grouped = {}
-    for m, dt in meetings:
-        eng = m["engagement"]
-        owner = str(eng.get("ownerId"))
-        cids = m.get("associations", {}).get("contactIds")
-        if not owner or not cids:
+    for m in meetings:
+        props = m["properties"]
+        owner = props.get("hubspot_owner_id")
+        if not owner:
             continue
 
-        contact = contacts.get(cids[0], "Unbekannter Kontakt")
-        title = eng.get("title") or "Meeting"
+        start_ms = int(props["hs_meeting_start_time"])
+        dt = datetime.fromtimestamp(start_ms / 1000, tz=TIMEZONE)
 
-        grouped.setdefault(owner, []).append((dt, contact, title))
+        assoc = m.get("associations", {}).get("contacts", {}).get("results", [])
+        if not assoc:
+            continue
 
-    msg = build_message(grouped, week_start, week_end)
-    requests.post(SLACK_WEBHOOK_URL, json={"text": msg}).raise_for_status()
+        contact_id = assoc[0]["id"]
+        contact = contacts.get(contact_id, "Unbekannter Kontakt")
+        title = props.get("hs_meeting_title", "Meeting")
 
-if __name__ == "__main__":
-    main()
+        grouped[owner].append((dt, contact, title))
+
+    message = build_message
