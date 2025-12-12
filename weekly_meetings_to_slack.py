@@ -3,6 +3,9 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# ==========================================================
+# ENV
+# ==========================================================
 HUBSPOT_API_KEY = os.environ["HUBSPOT_API_KEY"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 
@@ -41,6 +44,9 @@ WEEKDAY_DE = {
     3: "Donnerstag", 4: "Freitag", 5: "Samstag", 6: "Sonntag"
 }
 
+# ==========================================================
+# WEEK WINDOW
+# ==========================================================
 def week_window(now):
     start = (now - timedelta(days=now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -48,12 +54,15 @@ def week_window(now):
     end = start + timedelta(days=7)
     return start, end
 
+# ==========================================================
+# FETCH MEETINGS (ENGAGEMENTS)
+# ==========================================================
 def fetch_meetings(week_start, week_end):
     url = "https://api.hubapi.com/engagements/v1/engagements/paged"
     meetings = []
     offset = 0
     page = 0
-    MAX_PAGES = 10  # 🔐 Sicherheitsbremse
+    MAX_PAGES = 10
 
     week_start_ms = int(week_start.timestamp() * 1000)
     week_end_ms = int(week_end.timestamp() * 1000)
@@ -73,18 +82,24 @@ def fetch_meetings(week_start, week_end):
 
         for item in data.get("results", []):
             eng = item.get("engagement", {})
+            meta = item.get("metadata", {})
+
             if eng.get("type") != "MEETING":
                 continue
 
-            ts = eng.get("timestamp")
-            if not ts:
+            # 🔑 DAS ist die echte Startzeit
+            start_ts = meta.get("startTime") or eng.get("timestamp")
+            if not start_ts:
                 continue
 
-            # 🔴 Sobald wir älter als diese Woche sind → STOP
-            if ts < week_start_ms:
+            start_ts = int(start_ts)
+
+            # 🔴 Abbruch sobald wir vor dieser Woche sind
+            if start_ts < week_start_ms:
                 return meetings
 
-            if week_start_ms <= ts < week_end_ms:
+            if week_start_ms <= start_ts < week_end_ms:
+                item["_start_ts"] = start_ts
                 meetings.append(item)
 
         if not data.get("hasMore"):
@@ -94,6 +109,9 @@ def fetch_meetings(week_start, week_end):
 
     return meetings
 
+# ==========================================================
+# CONTACTS
+# ==========================================================
 def batch_read_contacts(contact_ids):
     if not contact_ids:
         return {}
@@ -103,7 +121,7 @@ def batch_read_contacts(contact_ids):
         headers=HEADERS,
         json={
             "properties": ["firstname", "lastname", "email"],
-            "inputs": [{"id": cid} for cid in contact_ids]
+            "inputs": [{"id": cid} for cid in contact_ids],
         }
     )
     r.raise_for_status()
@@ -115,6 +133,9 @@ def batch_read_contacts(contact_ids):
         out[res["id"]] = name or p.get("email") or f"Contact {res['id']}"
     return out
 
+# ==========================================================
+# BUILD SLACK MESSAGE
+# ==========================================================
 def build_message(grouped, week_start, week_end):
     ws = week_start.strftime("%d.%m.%Y")
     we = (week_end - timedelta(seconds=1)).strftime("%d.%m.%Y")
@@ -149,6 +170,9 @@ def build_message(grouped, week_start, week_end):
 
     return "\n".join(lines)
 
+# ==========================================================
+# MAIN
+# ==========================================================
 def main():
     now = datetime.now(TIMEZONE)
     week_start, week_end = week_window(now)
@@ -172,7 +196,7 @@ def main():
         if not cids:
             continue
 
-        dt = datetime.fromtimestamp(eng["timestamp"] / 1000, tz=TIMEZONE)
+        dt = datetime.fromtimestamp(m["_start_ts"] / 1000, tz=TIMEZONE)
         title = eng.get("title") or "Meeting"
         contact = contacts.get(cids[0], "Unbekannter Kontakt")
 
@@ -181,7 +205,10 @@ def main():
     for o in grouped:
         grouped[o].sort(key=lambda x: x[0])
 
-    r = requests.post(SLACK_WEBHOOK_URL, json={"text": build_message(grouped, week_start, week_end)})
+    r = requests.post(
+        SLACK_WEBHOOK_URL,
+        json={"text": build_message(grouped, week_start, week_end)}
+    )
     r.raise_for_status()
 
 if __name__ == "__main__":
