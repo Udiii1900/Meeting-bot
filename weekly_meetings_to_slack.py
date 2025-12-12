@@ -49,37 +49,12 @@ def week_window(now):
     end = start + timedelta(days=7)
     return start, end
 
-def parse_hubspot_datetime(value: str) -> datetime:
-    """
-    HubSpot kann Datetime-Properties als
-    - Milliseconds (string/int) oder
-    - ISO-8601 String (z.B. 2025-12-08T10:00:00Z)
-    liefern.
-    """
-    if value is None or value == "":
-        raise ValueError("Empty datetime value")
-
-    # 1) ms / seconds numeric?
-    try:
-        num = int(value)
-        # Heuristik: < 10^10 => seconds, sonst ms
-        if num < 10_000_000_000:
-            num *= 1000
-        return datetime.fromtimestamp(num / 1000, tz=TIMEZONE)
-    except (ValueError, TypeError):
-        pass
-
-    # 2) ISO-8601 String (mit Z)
-    # Python: "Z" -> "+00:00"
-    iso = str(value).replace("Z", "+00:00")
-    dt_utc = datetime.fromisoformat(iso)
-    if dt_utc.tzinfo is None:
-        # falls ohne TZ kommt, als UTC interpretieren
-        dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
-    return dt_utc.astimezone(TIMEZONE)
-
 def fetch_meetings(week_start, week_end):
     url = "https://api.hubapi.com/crm/v3/objects/meetings/search"
+
+    start_ms = str(int(week_start.timestamp() * 1000))
+    end_ms = str(int(week_end.timestamp() * 1000))
+
     body = {
         "properties": [
             "hs_meeting_start_time",
@@ -87,18 +62,24 @@ def fetch_meetings(week_start, week_end):
             "hs_meeting_title"
         ],
         "associations": ["contacts"],
-        "filterGroups": [{
-            "filters": [{
+        "filterGroups": [
+            {
+                "filters": [
+                    {
+                        "propertyName": "hs_meeting_start_time",
+                        "operator": "BETWEEN",
+                        "value": start_ms,
+                        "highValue": end_ms
+                    }
+                ]
+            }
+        ],
+        "sorts": [
+            {
                 "propertyName": "hs_meeting_start_time",
-                "operator": "BETWEEN",
-                "value": week_start.isoformat(),
-                "highValue": week_end.isoformat()
-            }]
-        }],
-        "sorts": [{
-            "propertyName": "hs_meeting_start_time",
-            "direction": "ASCENDING"
-        }],
+                "direction": "ASCENDING"
+            }
+        ],
         "limit": 100
     }
 
@@ -167,47 +148,31 @@ def main():
 
     meetings = fetch_meetings(week_start, week_end)
 
-    # Kontakte sammeln
     contact_ids = set()
     for m in meetings:
-        assoc = m.get("associations", {}).get("contacts", {}).get("results", [])
-        for a in assoc:
+        for a in m.get("associations", {}).get("contacts", {}).get("results", []):
             contact_ids.add(a["id"])
 
     contacts = batch_read_contacts(list(contact_ids))
-
     grouped = defaultdict(list)
+
     for m in meetings:
-        props = m.get("properties", {}) or {}
+        props = m.get("properties", {})
         owner = props.get("hubspot_owner_id")
         if not owner:
             continue
 
-        start_val = props.get("hs_meeting_start_time")
-        if not start_val:
-            continue
-
-        dt = parse_hubspot_datetime(start_val)
-
-        # nur Zukunft + diese Woche
-        if not (week_start <= dt < week_end):
-            continue
-        if dt < now:
-            continue
+        start_ms = int(props["hs_meeting_start_time"])
+        dt = datetime.fromtimestamp(start_ms / 1000, tz=TIMEZONE)
 
         assoc = m.get("associations", {}).get("contacts", {}).get("results", [])
         if not assoc:
             continue
 
-        contact_id = assoc[0]["id"]
-        contact = contacts.get(contact_id, "Unbekannter Kontakt")
-        title = props.get("hs_meeting_title") or "Meeting"
+        contact = contacts.get(assoc[0]["id"], "Unbekannter Kontakt")
+        title = props.get("hs_meeting_title", "Meeting")
 
         grouped[str(owner)].append((dt, contact, title))
-
-    # sort
-    for o in grouped:
-        grouped[o].sort(key=lambda x: x[0])
 
     msg = build_message(grouped, week_start, week_end)
     requests.post(SLACK_WEBHOOK_URL, json={"text": msg}).raise_for_status()
