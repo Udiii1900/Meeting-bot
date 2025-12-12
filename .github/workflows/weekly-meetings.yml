@@ -2,8 +2,14 @@ name: Weekly Meetings to Slack
 
 on:
   schedule:
-    - cron: "30 7 * * 1"
-    - cron: "30 7 * * 3"
+    # Sommerzeit (CEST = UTC+2) → 08:00 CEST = 06:00 UTC
+    - cron: "0 6 * 3-10 1"
+    - cron: "0 6 * 3-10 3"
+
+    # Winterzeit (CET = UTC+1) → 08:00 CET = 07:00 UTC
+    - cron: "0 7 * 11,12,1,2 1"
+    - cron: "0 7 * 11,12,1,2 3"
+
   workflow_dispatch:
 
 jobs:
