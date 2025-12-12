@@ -193,4 +193,8 @@ def main():
 
         grouped[owner].append((dt, contact, title))
 
-    message = build_message
+    message = build_message(grouped, week_start, week_end)
+    requests.post(SLACK_WEBHOOK_URL, json={"text": message}).raise_for_status()
+
+if __name__ == "__main__":
+    main()
