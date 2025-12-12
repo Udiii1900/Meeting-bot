@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ==========================================================
-# ENV VARS (aus GitHub Secrets)
+# ENV VARS
 # ==========================================================
 HUBSPOT_API_KEY = os.environ["HUBSPOT_API_KEY"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
@@ -36,73 +36,76 @@ OWNER_TO_SLACK = {
     "30840582": "<@U09QW1PVCCS>",
     "30287832": "<@U07M9P6JZ5G>",
     "31172664": "<@U0A0P2V70MC>",
-    "30740680": "<@U09LSSAB3LH>"
+    "30740680": "<@U09LSSAB3LH>",
 }
 
 WEEKDAY_DE = {
-    0: "Montag",
-    1: "Dienstag",
-    2: "Mittwoch",
-    3: "Donnerstag",
-    4: "Freitag",
-    5: "Samstag",
-    6: "Sonntag",
+    0: "Montag", 1: "Dienstag", 2: "Mittwoch",
+    3: "Donnerstag", 4: "Freitag", 5: "Samstag", 6: "Sonntag"
 }
 
 # ==========================================================
-# ZEITFENSTER: diese Woche (Mo–So) + nur Zukunft
+# ZEITFENSTER
 # ==========================================================
-def week_window_ms(now):
-    start_of_week = (now - timedelta(days=now.weekday())).replace(
+def week_window(now):
+    start = (now - timedelta(days=now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    end_of_week = start_of_week + timedelta(days=7)
-
-    start_ms = int(start_of_week.timestamp() * 1000)
-    end_ms = int(end_of_week.timestamp() * 1000)
-    now_ms = int(now.timestamp() * 1000)
-
-    return max(start_ms, now_ms), end_ms, start_of_week, end_of_week
-
+    end = start + timedelta(days=7)
+    return start, end
 
 # ==========================================================
-# APPOINTMENTS LISTEN (KEIN SEARCH!)
+# TIMESTAMP NORMALISIEREN (SEK → MS)
 # ==========================================================
-def fetch_appointments(from_ms, to_ms):
+def normalize_ts(value):
+    ts = int(value)
+    # alles < Jahr 2001 in ms ist Sekunden
+    if ts < 10_000_000_000:
+        ts *= 1000
+    return ts
+
+# ==========================================================
+# APPOINTMENTS LISTEN
+# ==========================================================
+def fetch_appointments(week_start, week_end):
     url = "https://api.hubapi.com/crm/v3/objects/appointments"
     results = []
     after = None
 
-    properties = [
-        "hs_timestamp",
+    props = [
         "hs_start_time",
+        "hs_timestamp",
         "hubspot_owner_id",
         "hs_owner_id",
-        "hs_title",
         "hs_appointment_title",
+        "hs_title",
     ]
+
+    week_start_ms = int(week_start.timestamp() * 1000)
+    week_end_ms = int(week_end.timestamp() * 1000)
 
     while True:
         params = {
             "limit": 100,
-            "properties": ",".join(properties),
+            "properties": ",".join(props),
         }
         if after:
             params["after"] = after
 
-        resp = requests.get(url, headers=HEADERS, params=params)
-        resp.raise_for_status()
-        data = resp.json()
+        r = requests.get(url, headers=HEADERS, params=params)
+        r.raise_for_status()
+        data = r.json()
 
         for item in data.get("results", []):
-            props = item.get("properties", {}) or {}
-
-            ts = props.get("hs_timestamp") or props.get("hs_start_time")
-            if not ts:
+            p = item.get("properties", {}) or {}
+            raw_ts = p.get("hs_start_time") or p.get("hs_timestamp")
+            if not raw_ts:
                 continue
 
-            ts = int(ts)
-            if from_ms <= ts < to_ms:
+            ts = normalize_ts(raw_ts)
+
+            if week_start_ms <= ts < week_end_ms:
+                item["_start_ts"] = ts
                 results.append(item)
 
         after = data.get("paging", {}).get("next", {}).get("after")
@@ -110,7 +113,6 @@ def fetch_appointments(from_ms, to_ms):
             break
 
     return results
-
 
 # ==========================================================
 # CONTACTS
@@ -120,7 +122,6 @@ def fetch_contact_ids(appointment_id):
     r = requests.get(url, headers=HEADERS)
     r.raise_for_status()
     return [x["id"] for x in r.json().get("results", [])]
-
 
 def batch_read_contacts(contact_ids):
     if not contact_ids:
@@ -140,9 +141,7 @@ def batch_read_contacts(contact_ids):
         p = res.get("properties", {}) or {}
         name = " ".join(filter(None, [p.get("firstname"), p.get("lastname")]))
         out[res["id"]] = name or p.get("email") or f"Contact {res['id']}"
-
     return out
-
 
 # ==========================================================
 # SLACK MESSAGE
@@ -164,76 +163,65 @@ def build_message(grouped, week_start, week_end):
     ]
 
     for owner_id, meetings in grouped.items():
-        slack_user = OWNER_TO_SLACK.get(owner_id, f"<ID {owner_id}>")
-        lines.append(f"*{slack_user}* hat diese Woche folgende anstehenden Meetings:")
+        slack = OWNER_TO_SLACK.get(owner_id, f"<ID {owner_id}>")
+        lines.append(f"*{slack}* hat diese Woche folgende anstehenden Meetings:")
 
         for dt, contact, title in meetings:
             lines.append(
                 f"• {contact} | {title} | "
                 f"{WEEKDAY_DE[dt.weekday()]}, {dt.strftime('%d.%m.%Y')}, {dt.strftime('%H:%M')}"
             )
-
         lines.append("")
 
     lines.append(
         "Solltet ihr noch offene Themen bei einem Kunden haben, "
         "die geklärt werden sollen, dann gebt bitte frühzeitig Bescheid."
     )
-
     return "\n".join(lines)
-
 
 # ==========================================================
 # MAIN
 # ==========================================================
 def main():
     now = datetime.now(TIMEZONE)
-    from_ms, to_ms, week_start, week_end = week_window_ms(now)
+    week_start, week_end = week_window(now)
 
-    appointments = fetch_appointments(from_ms, to_ms)
+    appointments = fetch_appointments(week_start, week_end)
 
-    appointment_contacts = {}
-    all_contact_ids = set()
+    contact_map = {}
+    all_contacts = set()
 
     for a in appointments:
         cids = fetch_contact_ids(a["id"])
         if cids:
-            appointment_contacts[a["id"]] = cids
-            all_contact_ids.update(cids)
+            contact_map[a["id"]] = cids
+            all_contacts.update(cids)
 
-    contacts_map = batch_read_contacts(list(all_contact_ids))
-
+    contacts = batch_read_contacts(list(all_contacts))
     grouped = {}
 
     for a in appointments:
         props = a.get("properties", {}) or {}
-
-        owner_id = props.get("hubspot_owner_id") or props.get("hs_owner_id")
-        if not owner_id:
+        owner = props.get("hubspot_owner_id") or props.get("hs_owner_id")
+        if not owner:
             continue
 
-        ts = props.get("hs_timestamp") or props.get("hs_start_time")
-        if not ts:
-            continue
-
-        cids = appointment_contacts.get(a["id"])
+        cids = contact_map.get(a["id"])
         if not cids:
-            continue  # Meetings ohne Kontakt ignorieren
+            continue
 
-        contact_name = contacts_map.get(cids[0], "Unbekannter Kontakt")
+        dt = datetime.fromtimestamp(a["_start_ts"] / 1000, tz=TIMEZONE)
         title = props.get("hs_appointment_title") or props.get("hs_title") or "Meeting"
+        contact = contacts.get(cids[0], "Unbekannter Kontakt")
 
-        dt = datetime.fromtimestamp(int(ts) / 1000, tz=TIMEZONE)
+        grouped.setdefault(owner, []).append((dt, contact, title))
 
-        grouped.setdefault(owner_id, []).append((dt, contact_name, title))
+    for o in grouped:
+        grouped[o].sort(key=lambda x: x[0])
 
-    for owner_id in grouped:
-        grouped[owner_id].sort(key=lambda x: x[0])
-
-    message = build_message(grouped, week_start, week_end)
-    r = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
+    msg = build_message(grouped, week_start, week_end)
+    r = requests.post(SLACK_WEBHOOK_URL, json={"text": msg})
     r.raise_for_status()
-
 
 if __name__ == "__main__":
     main()
