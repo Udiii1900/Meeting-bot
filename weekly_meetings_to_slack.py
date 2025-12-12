@@ -3,9 +3,6 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# ==========================================================
-# ENV VARS
-# ==========================================================
 HUBSPOT_API_KEY = os.environ["HUBSPOT_API_KEY"]
 SLACK_WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 
@@ -44,9 +41,6 @@ WEEKDAY_DE = {
     3: "Donnerstag", 4: "Freitag", 5: "Samstag", 6: "Sonntag"
 }
 
-# ==========================================================
-# ZEITFENSTER: diese Woche
-# ==========================================================
 def week_window(now):
     start = (now - timedelta(days=now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -54,37 +48,42 @@ def week_window(now):
     end = start + timedelta(days=7)
     return start, end
 
-# ==========================================================
-# ENGAGEMENTS (MEETINGS)
-# ==========================================================
 def fetch_meetings(week_start, week_end):
     url = "https://api.hubapi.com/engagements/v1/engagements/paged"
     meetings = []
     offset = 0
+    page = 0
+    MAX_PAGES = 10  # 🔐 Sicherheitsbremse
 
     week_start_ms = int(week_start.timestamp() * 1000)
     week_end_ms = int(week_end.timestamp() * 1000)
 
     while True:
-        params = {
-            "limit": 100,
-            "offset": offset
-        }
+        page += 1
+        if page > MAX_PAGES:
+            break
 
-        r = requests.get(url, headers=HEADERS, params=params)
+        r = requests.get(
+            url,
+            headers=HEADERS,
+            params={"limit": 100, "offset": offset}
+        )
         r.raise_for_status()
         data = r.json()
 
         for item in data.get("results", []):
-            engagement = item.get("engagement", {})
-            if engagement.get("type") != "MEETING":
+            eng = item.get("engagement", {})
+            if eng.get("type") != "MEETING":
                 continue
 
-            ts = engagement.get("timestamp")
+            ts = eng.get("timestamp")
             if not ts:
                 continue
 
-            # nur Meetings in dieser Woche
+            # 🔴 Sobald wir älter als diese Woche sind → STOP
+            if ts < week_start_ms:
+                return meetings
+
             if week_start_ms <= ts < week_end_ms:
                 meetings.append(item)
 
@@ -95,20 +94,18 @@ def fetch_meetings(week_start, week_end):
 
     return meetings
 
-# ==========================================================
-# CONTACTS
-# ==========================================================
 def batch_read_contacts(contact_ids):
     if not contact_ids:
         return {}
 
-    url = "https://api.hubapi.com/crm/v3/objects/contacts/batch/read"
-    body = {
-        "properties": ["firstname", "lastname", "email"],
-        "inputs": [{"id": cid} for cid in contact_ids]
-    }
-
-    r = requests.post(url, headers=HEADERS, json=body)
+    r = requests.post(
+        "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+        headers=HEADERS,
+        json={
+            "properties": ["firstname", "lastname", "email"],
+            "inputs": [{"id": cid} for cid in contact_ids]
+        }
+    )
     r.raise_for_status()
 
     out = {}
@@ -116,12 +113,8 @@ def batch_read_contacts(contact_ids):
         p = res.get("properties", {}) or {}
         name = " ".join(filter(None, [p.get("firstname"), p.get("lastname")]))
         out[res["id"]] = name or p.get("email") or f"Contact {res['id']}"
-
     return out
 
-# ==========================================================
-# SLACK MESSAGE
-# ==========================================================
 def build_message(grouped, week_start, week_end):
     ws = week_start.strftime("%d.%m.%Y")
     we = (week_end - timedelta(seconds=1)).strftime("%d.%m.%Y")
@@ -139,8 +132,8 @@ def build_message(grouped, week_start, week_end):
     ]
 
     for owner_id, meetings in grouped.items():
-        slack_user = OWNER_TO_SLACK.get(str(owner_id), f"<ID {owner_id}>")
-        lines.append(f"*{slack_user}* hat diese Woche folgende anstehenden Meetings:")
+        slack = OWNER_TO_SLACK.get(owner_id, f"<ID {owner_id}>")
+        lines.append(f"*{slack}* hat diese Woche folgende anstehenden Meetings:")
 
         for dt, contact, title in meetings:
             lines.append(
@@ -156,16 +149,12 @@ def build_message(grouped, week_start, week_end):
 
     return "\n".join(lines)
 
-# ==========================================================
-# MAIN
-# ==========================================================
 def main():
     now = datetime.now(TIMEZONE)
     week_start, week_end = week_window(now)
 
     meetings = fetch_meetings(week_start, week_end)
 
-    # Alle Kontakt-IDs sammeln
     all_contact_ids = set()
     for m in meetings:
         all_contact_ids.update(m.get("associations", {}).get("contactIds", []))
@@ -173,28 +162,26 @@ def main():
     contacts = batch_read_contacts(list(all_contact_ids))
 
     grouped = {}
-
     for m in meetings:
-        engagement = m.get("engagement", {})
-        owner_id = engagement.get("ownerId")
-        if not owner_id:
+        eng = m["engagement"]
+        owner = str(eng.get("ownerId"))
+        if not owner:
             continue
 
-        contact_ids = m.get("associations", {}).get("contactIds")
-        if not contact_ids:
+        cids = m.get("associations", {}).get("contactIds")
+        if not cids:
             continue
 
-        contact_name = contacts.get(contact_ids[0], "Unbekannter Kontakt")
-        dt = datetime.fromtimestamp(engagement["timestamp"] / 1000, tz=TIMEZONE)
-        title = engagement.get("title") or "Meeting"
+        dt = datetime.fromtimestamp(eng["timestamp"] / 1000, tz=TIMEZONE)
+        title = eng.get("title") or "Meeting"
+        contact = contacts.get(cids[0], "Unbekannter Kontakt")
 
-        grouped.setdefault(str(owner_id), []).append((dt, contact_name, title))
+        grouped.setdefault(owner, []).append((dt, contact, title))
 
-    for owner_id in grouped:
-        grouped[owner_id].sort(key=lambda x: x[0])
+    for o in grouped:
+        grouped[o].sort(key=lambda x: x[0])
 
-    message = build_message(grouped, week_start, week_end)
-    r = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
+    r = requests.post(SLACK_WEBHOOK_URL, json={"text": build_message(grouped, week_start, week_end)})
     r.raise_for_status()
 
 if __name__ == "__main__":
