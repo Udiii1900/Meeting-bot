@@ -50,7 +50,11 @@ WEEKDAY_DE = {
 # Helpers
 # =========================
 def post_to_slack(text: str):
-    r = requests.post(SLACK_WEBHOOK_URL, json={"text": text})
+    payload = {
+        "text": text,
+        "link_names": 1
+    }
+    r = requests.post(SLACK_WEBHOOK_URL, json=payload)
     r.raise_for_status()
 
 def week_window(now: datetime):
@@ -59,25 +63,17 @@ def week_window(now: datetime):
     return start, end
 
 def parse_hubspot_datetime(value) -> datetime:
-    """
-    HubSpot liefert Datetime-Properties portalabhängig als:
-    - ISO8601 (z.B. 2025-12-08T10:00:00Z)
-    - ms (z.B. 1765148400000)
-    - seconds (z.B. 1765148400)
-    """
     if value is None or value == "":
         raise ValueError("Empty datetime")
 
-    # numeric?
     try:
         num = int(value)
-        if num < 10_000_000_000:  # seconds -> ms
+        if num < 10_000_000_000:
             num *= 1000
         return datetime.fromtimestamp(num / 1000, tz=TIMEZONE)
     except (ValueError, TypeError):
         pass
 
-    # ISO
     iso = str(value).replace("Z", "+00:00")
     dt = datetime.fromisoformat(iso)
     if dt.tzinfo is None:
@@ -94,12 +90,6 @@ def meetings_search(body: dict):
     return r.json().get("results", [])
 
 def fetch_meetings_candidates(week_start: datetime, week_end: datetime):
-    """
-    Robust:
-    1) Search mit ms BETWEEN
-    2) Falls 0 Ergebnisse: Search mit ISO BETWEEN
-    3) Falls immer noch 0: unfiltered Search (limit 100), dann lokal filtern
-    """
     props = ["hs_meeting_start_time", "hubspot_owner_id", "hs_meeting_title"]
 
     start_ms = str(int(week_start.timestamp() * 1000))
@@ -123,7 +113,6 @@ def fetch_meetings_candidates(week_start: datetime, week_end: datetime):
     if res:
         return res, "search_between_ms"
 
-    # Attempt ISO range
     body_iso = {
         "properties": props,
         "filterGroups": [{
@@ -142,7 +131,6 @@ def fetch_meetings_candidates(week_start: datetime, week_end: datetime):
     if res:
         return res, "search_between_iso"
 
-    # Fallback: no filter, just get newest-ish and local filter
     body_any = {
         "properties": props,
         "sorts": [{"propertyName": "hs_meeting_start_time", "direction": "DESCENDING"}],
@@ -152,7 +140,6 @@ def fetch_meetings_candidates(week_start: datetime, week_end: datetime):
     return res, "search_unfiltered_fallback"
 
 def fetch_contact_ids_for_meeting(meeting_id: str):
-    # v3 associations endpoint
     url = f"https://api.hubapi.com/crm/v3/objects/meetings/{meeting_id}/associations/contacts"
     r = requests.get(url, headers=HEADERS)
     r.raise_for_status()
@@ -187,19 +174,26 @@ def build_message(grouped, week_start, week_end):
     ws = week_start.strftime("%d.%m.%Y")
     we = (week_end - timedelta(seconds=1)).strftime("%d.%m.%Y")
 
+    footer = (
+        "\nBitte reagiert auf diese Nachricht mit ✅, "
+        "wenn zu euren Mandanten keine offenen Themen mehr bestehen. Danke!"
+    )
+
     if not grouped:
         return (
+            f"@here\n"
             f"📅 *Wochenübersicht – Meetings*\n"
             f"🗓️ Zeitraum: {ws} - {we}\n\n"
             f"✅ Diese Woche stehen keine anstehenden Meetings an."
+            f"{footer}"
         )
 
     lines = [
+        "@here",
         "📅 *Wochenübersicht – Meetings*",
         f"🗓️ Zeitraum: {ws} - {we}\n",
     ]
 
-    # sort owners by earliest meeting
     owners_sorted = sorted(grouped.keys(), key=lambda o: grouped[o][0][0])
 
     for owner in owners_sorted:
@@ -211,9 +205,7 @@ def build_message(grouped, week_start, week_end):
             )
         lines.append("")
 
-    lines.append(
-        "Solltet ihr noch offene Themen bei einem Kunden haben, die geklärt werden sollen, dann gebt bitte frühzeitig Bescheid."
-    )
+    lines.append(footer)
     return "\n".join(lines)
 
 # =========================
@@ -225,7 +217,6 @@ def main():
 
     meetings_raw, mode = fetch_meetings_candidates(week_start, week_end)
 
-    # lokal filtern (auch wenn Search gefiltert hat, ist das safe)
     candidates = []
     parse_errors = 0
 
@@ -251,16 +242,13 @@ def main():
 
         candidates.append((m["id"], str(owner), dt, title, start_val))
 
-    # jetzt Kontakte IMMER über Associations endpoint holen
     meeting_to_contact_ids = {}
     all_contact_ids = set()
-    assoc_fail = 0
 
     for meeting_id, _, _, _, _ in candidates:
         try:
             cids = fetch_contact_ids_for_meeting(meeting_id)
         except Exception:
-            assoc_fail += 1
             cids = []
         meeting_to_contact_ids[meeting_id] = cids
         all_contact_ids.update(cids)
@@ -268,38 +256,16 @@ def main():
     contacts = batch_read_contacts(list(all_contact_ids))
 
     grouped = defaultdict(list)
-    no_contact = 0
 
     for meeting_id, owner, dt, title, _start_val in candidates:
         cids = meeting_to_contact_ids.get(meeting_id, [])
         if not cids:
-            no_contact += 1
             continue
         contact_name = contacts.get(cids[0], f"Contact {cids[0]}")
         grouped[owner].append((dt, contact_name, title))
 
     for owner in grouped:
         grouped[owner].sort(key=lambda x: x[0])
-
-    # Debug (einmalig super hilfreich)
-    if DEBUG:
-        sample = candidates[:3]
-        sample_lines = "\n".join(
-            [f"- id={mid}, owner={own}, start_raw={sv}, dt={dt.isoformat()}"
-             for (mid, own, dt, _t, sv) in sample]
-        ) or "- (keine candidates)"
-        dbg = (
-            "🧪 *DEBUG MeetingsBot*\n"
-            f"Mode: `{mode}`\n"
-            f"Meetings raw: {len(meetings_raw)}\n"
-            f"Candidates (in week & future): {len(candidates)}\n"
-            f"Parse errors: {parse_errors}\n"
-            f"Assoc failures: {assoc_fail}\n"
-            f"Candidates ohne Kontakte: {no_contact}\n"
-            f"Owners mit Meetings: {len(grouped)}\n"
-            f"Samples:\n{sample_lines}"
-        )
-        post_to_slack(dbg)
 
     msg = build_message(grouped, week_start, week_end)
     post_to_slack(msg)
