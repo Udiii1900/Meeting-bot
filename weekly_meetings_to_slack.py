@@ -1,4 +1,4 @@
-import os
+
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
